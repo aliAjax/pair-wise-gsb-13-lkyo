@@ -1,271 +1,317 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import { ElMessageBox } from "element-plus";
+import {
+  SwitchButton,
+  Refresh,
+  DocumentAdd,
+  WarningFilled,
+  Connection
+} from "@element-plus/icons-vue";
+import { useHandover } from "./handover/useHandover";
+import type { NewAmendmentInput, NewItemInput, ShiftSlot } from "./types";
+import OrderDetail from "./components/OrderDetail.vue";
+import AmendmentDialog from "./components/AmendmentDialog.vue";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const h = useHandover();
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+const STAFF = ["王强", "李娜", "赵磊"];
+const SLOTS: ShiftSlot[] = ["早班", "中班", "晚班"];
+const actor = ref("李娜");
+h.setActor(actor.value);
 
-const project = {
-  "number": 7,
-  "folder": "dfwl/frontend/dfwlfront-7",
-  "framework": "vue",
-  "title": "加油站班次交接",
-  "subtitle": "录入油品销量和收款数据，自动计算当班总收入。",
-  "industry": "石油",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Element Plus"
-  ],
-  "storageKey": "dfwlfront-7-shift",
-  "formTitle": "新增交接记录",
-  "primaryAction": "保存交接",
-  "entityLabel": "班次",
-  "statuses": [
-    "待复核",
-    "已复核",
-    "有差异"
-  ],
-  "filters": [
-    "全部班次",
-    "早班",
-    "中班",
-    "晚班"
-  ],
-  "fields": [
-    {
-      "key": "shift",
-      "label": "班次",
-      "type": "select",
-      "options": [
-        "早班",
-        "中班",
-        "晚班"
-      ]
-    },
-    {
-      "key": "fuelSales",
-      "label": "油品销量L",
-      "type": "number"
-    },
-    {
-      "key": "cash",
-      "label": "现金收入",
-      "type": "number"
-    },
-    {
-      "key": "digital",
-      "label": "电子支付",
-      "type": "number"
-    }
-  ],
-  "records": [
-    {
-      "shift": "早班",
-      "fuelSales": 4280,
-      "cash": 8300,
-      "digital": 21000,
-      "status": "已复核",
-      "notes": "账实一致"
-    },
-    {
-      "shift": "中班",
-      "fuelSales": 3910,
-      "cash": 6400,
-      "digital": 19800,
-      "status": "待复核",
-      "notes": "等待站长确认"
-    }
-  ],
-  "metricLabels": [
-    "交接记录",
-    "已复核",
-    "总收入"
-  ]
-} as const;
-
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
+function switchActor(name: string) {
+  actor.value = name;
+  h.setActor(name);
 }
 
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
+type Filter = "open" | "signed" | "void" | "amendment" | "all";
+const filter = ref<Filter>("open");
+
+const visibleOrders = computed(() => {
+  switch (filter.value) {
+    case "open":
+      return h.orders.value.filter((o) => o.status === "draft" || o.status === "finalized");
+    case "signed":
+      return h.orders.value.filter((o) => o.status === "signed");
+    case "void":
+      return h.orders.value.filter((o) => o.status === "void");
+    case "amendment":
+      return h.orders.value.filter((o) => o.kind === "amendment");
+    default:
+      return h.orders.value;
   }
+});
+
+const selectedId = ref<string | null>(null);
+const selectedOrder = computed(
+  () => h.orders.value.find((o) => o.id === selectedId.value) ?? visibleOrders.value[0] ?? null
+);
+
+function selectOrder(id: string) {
+  selectedId.value = id;
+}
+
+/* ---------- 新建 / 补建 ---------- */
+const newDlg = ref(false);
+const newForm = reactive({
+  shiftDate: new Date().toISOString().slice(0, 10),
+  shiftSlot: "早班" as ShiftSlot,
+  outgoing: actor.value,
+  incoming: "赵磊",
+  backfilled: false
+});
+
+function openNewDialog(backfill?: { date: string; slot: ShiftSlot; outgoing: string; incoming: string }) {
+  if (backfill) {
+    Object.assign(newForm, {
+      shiftDate: backfill.date,
+      shiftSlot: backfill.slot,
+      outgoing: backfill.outgoing,
+      incoming: backfill.incoming,
+      backfilled: true
+    });
+  } else {
+    Object.assign(newForm, {
+      shiftDate: new Date().toISOString().slice(0, 10),
+      shiftSlot: "早班",
+      outgoing: actor.value,
+      incoming: STAFF.find((s) => s !== actor.value) ?? "赵磊",
+      backfilled: false
+    });
+  }
+  newDlg.value = true;
+}
+
+function submitNew() {
+  const order = h.createOrder({ ...newForm });
+  if (order) {
+    newDlg.value = false;
+    selectedId.value = order.id;
+    filter.value = "open";
+  }
+}
+
+/* ---------- 修订单 ---------- */
+const amendDlg = ref(false);
+const amendPreset = ref<{ type: "supplement" | "revoke" | "reassign"; itemId?: string } | null>(null);
+
+function openAmendment(preset: { type: "supplement" | "revoke" | "reassign"; itemId?: string }) {
+  amendPreset.value = preset;
+  amendDlg.value = true;
+}
+
+function submitAmendment(input: NewAmendmentInput) {
+  const order = h.createAmendment(input);
+  if (order) {
+    amendDlg.value = false;
+    selectedId.value = order.id;
+    filter.value = "open";
+  }
+}
+
+/* ---------- 事件透传 ---------- */
+function accept(orderId: string, itemId: string, note: string) {
+  h.acceptItem(orderId, itemId, note);
+}
+function reject(orderId: string, itemId: string, reason: string) {
+  h.rejectItem(orderId, itemId, reason);
+}
+function addItem(orderId: string, input: NewItemInput) {
+  h.addItem(orderId, input);
+}
+
+async function simulateReboot() {
   try {
-    return JSON.parse(raw) as RecordItem[];
+    await ElMessageBox.confirm(
+      "模拟电脑关机后重新开机：未完成交接单将原样续接，已接收项不会重开或丢失。",
+      "中途关机重开",
+      { confirmButtonText: "重启并续接", cancelButtonText: "取消", type: "warning" }
+    );
+    h.simulateReboot();
   } catch {
-    return [];
+    /* 取消 */
   }
 }
 
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
-
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
-});
-
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
-
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
-
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
-
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
-}
-
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
-
-function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
-}
-
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
-}
-
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
+function fmtShift(date: string, slot: string) {
+  return `${date} ${slot}`;
 }
 </script>
 
 <template>
-  <main class="app">
-    <div class="shell">
-      <header class="topbar">
+  <el-container class="layout">
+    <el-header class="topbar">
+      <div class="brand">
+        <el-icon class="brand-icon"><Connection /></el-icon>
         <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
+          <h1>加油站班次交接</h1>
+          <p>油款 · 设备异常 · 顾客退款：定稿成单 → 逐项接收/退回 → 签收转责</p>
         </div>
-        <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
+      </div>
+      <div class="top-ops">
+        <el-button :icon="Refresh" @click="simulateReboot">模拟关机重开</el-button>
+        <el-button text @click="h.resetAll()">重置演示数据</el-button>
+        <el-divider direction="vertical" />
+        <el-icon class="switch-icon"><SwitchButton /></el-icon>
+        <el-select :model-value="actor" style="width: 110px" @update:model-value="switchActor">
+          <el-option v-for="name in STAFF" :key="name" :label="name" :value="name" />
+        </el-select>
+      </div>
+    </el-header>
+
+    <!-- 开机续接横幅 -->
+    <el-alert
+      v-if="h.recoveredOnBoot && h.openOrders.value.length"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="boot-banner"
+    >
+      <template #title>
+        开机续接：发现 {{ h.openOrders.value.length }} 张未完成交接单，已按原状态恢复——已接收项保留，不能重开；请继续逐项处理。
+      </template>
+    </el-alert>
+    <el-alert
+      v-if="h.corruptedOnBoot"
+      type="error"
+      show-icon
+      :closable="false"
+      class="boot-banner"
+      title="本地数据损坏，原始数据已另存备份（*.corrupt-*），当前载入安全数据。"
+    />
+
+    <main class="content">
+      <!-- 左：列表 -->
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <el-radio-group v-model="filter" size="small">
+            <el-radio-button value="open">进行中 {{ h.openOrders.value.length }}</el-radio-button>
+            <el-radio-button value="signed">已签收</el-radio-button>
+            <el-radio-button value="amendment">修订单</el-radio-button>
+            <el-radio-button value="void">作废</el-radio-button>
+            <el-radio-button value="all">全部</el-radio-button>
+          </el-radio-group>
+          <el-button type="primary" :icon="DocumentAdd" @click="openNewDialog()">新建交接单</el-button>
         </div>
-      </header>
 
-      <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
-        </article>
-      </section>
-
-      <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
-          <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
-              </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
-            </label>
-            <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
-            </label>
-            <button type="submit">{{ project.primaryAction }}</button>
+        <!-- 旧班次缺单提示 -->
+        <el-card v-if="h.missingShifts.value.length" shadow="never" class="missing-card">
+          <div class="missing-title">
+            <el-icon class="warn"><WarningFilled /></el-icon>
+            <span>以下班次还没有交接单，下次换班需补齐：</span>
           </div>
-        </form>
-
-        <section class="list-panel">
-          <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
-            </select>
+          <div v-for="shift in h.missingShifts.value" :key="shift.date + shift.slot" class="missing-row">
+            <span>{{ fmtShift(shift.date, shift.slot) }}：{{ shift.outgoing }} → {{ shift.incoming }}</span>
+            <el-button size="small" type="warning" plain @click="openNewDialog(shift)">补建</el-button>
           </div>
+        </el-card>
 
-          <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
-              <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
-              </div>
-              <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
-              </div>
-              <p class="note">{{ record.notes }}</p>
-              <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
-              </div>
-            </article>
-          </div>
-
-          <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
-              <strong>{{ row.value }}</strong>
+        <div class="order-list">
+          <button
+            v-for="order in visibleOrders"
+            :key="order.id"
+            class="order-item"
+            :class="{ active: selectedOrder?.id === order.id }"
+            @click="selectOrder(order.id)"
+          >
+            <div class="oi-top">
+              <span class="oi-no">{{ order.bizNo }}</span>
+              <el-tag
+                :type="{ draft: 'info', finalized: 'warning', signed: 'success', void: 'danger' }[order.status]"
+                size="small"
+              >
+                {{ { draft: "草稿", finalized: "待逐项接收", signed: "已签收", void: "作废" }[order.status] }}
+              </el-tag>
             </div>
-          </div>
-        </section>
+            <div class="oi-sub">
+              {{ order.shiftDate }} {{ order.shiftSlot }} · {{ order.outgoing }}→{{ order.incoming }}
+              <el-tag v-if="order.kind === 'amendment'" size="small" type="warning" effect="plain" class="am-tag">修订单</el-tag>
+              <el-tag v-else-if="order.backfilled" size="small" type="info" effect="plain" class="am-tag">补建</el-tag>
+            </div>
+            <div v-if="order.status === 'finalized'" class="oi-progress">
+              <el-progress
+                :percentage="Math.round(
+                  (order.items.filter((i) => i.status !== 'pending').length / Math.max(order.items.length, 1)) * 100
+                )"
+                :stroke-width="6"
+                :show-text="false"
+              />
+              <span>{{ order.items.filter((i) => i.status === 'accepted').length }} 收 /
+                {{ order.items.filter((i) => i.status === 'rejected').length }} 退 /
+                {{ order.items.filter((i) => i.status === 'pending').length }} 待</span>
+            </div>
+          </button>
+          <el-empty v-if="!visibleOrders.length" description="没有匹配的交接单" :image-size="72" />
+        </div>
+      </aside>
+
+      <!-- 右：详情 -->
+      <section class="detail">
+        <OrderDetail
+          v-if="selectedOrder"
+          :key="selectedOrder.id"
+          :order="selectedOrder"
+          :actor="actor"
+          :all-orders="h.orders.value"
+          @add-item="addItem"
+          @remove-item="h.removeItem"
+          @finalize="h.finalize"
+          @accept="accept"
+          @reject="reject"
+          @resolve="h.resolveRejected"
+          @sign="h.sign"
+          @void-order="h.voidDraft"
+          @amend="openAmendment"
+          @open-order="selectOrder"
+        />
+        <el-empty v-else description="选择或新建一张交接单开始交接" />
       </section>
-    </div>
-  </main>
+    </main>
+
+    <!-- 新建/补建 -->
+    <el-dialog v-model="newDlg" :title="newForm.backfilled ? '补建旧班次交接单' : '新建交接单'" width="440px">
+      <el-alert
+        v-if="newForm.backfilled"
+        type="warning"
+        :closable="false"
+        title="旧班次原先没有交接单：现在补建并正常走完定稿、接收、签收；记录会标注为补建。"
+        class="new-alert"
+      />
+      <el-form label-width="86px">
+        <el-form-item label="班次日期">
+          <el-date-picker v-model="newForm.shiftDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+        </el-form-item>
+        <el-form-item label="班次">
+          <el-radio-group v-model="newForm.shiftSlot">
+            <el-radio v-for="s in SLOTS" :key="s" :value="s">{{ s }}</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="交班人">
+          <el-select v-model="newForm.outgoing" style="width: 100%">
+            <el-option v-for="name in STAFF" :key="name" :label="name" :value="name" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="接棒人">
+          <el-select v-model="newForm.incoming" style="width: 100%">
+            <el-option v-for="name in STAFF" :key="name" :label="name" :value="name" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="newDlg = false">取消</el-button>
+        <el-button type="primary" @click="submitNew">{{ newForm.backfilled ? "补建" : "创建" }}</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 补记/撤销/改派 -->
+    <AmendmentDialog
+      :visible="amendDlg"
+      :source="selectedOrder"
+      :actor="actor"
+      :preset="amendPreset"
+      @close="amendDlg = false"
+      @submit="submitAmendment"
+    />
+  </el-container>
 </template>
